@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env.local
+.env.ai*
+supabase/functions/.env
+*.log
+.DS_Store
+
+.claude/
+.tmp-model-inspect/
+charlize-theron-head.zip
+supabase/.temp/
