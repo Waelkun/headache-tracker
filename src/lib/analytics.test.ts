@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { answerDataQuestion, buildAskSummary, buildInterventionStats, buildOverview, buildWeekdayRisk, parseHeadacheText, type EpisodeLike } from './analytics'
+import { answerDataQuestion, buildAskSummary, buildInterventionStats, buildOverview, buildWeekView, buildWeekdayRisk, earliestWeekStart, parseHeadacheText, startOfWeek, type EpisodeLike } from './analytics'
 
 const episodes: EpisodeLike[] = [
   {
@@ -57,6 +57,27 @@ describe('headache analytics', () => {
 
   it('answers what-helped from effect ratings', () => {
     expect(answerDataQuestion('what helped my headache?', episodes, 'en')).toContain('Panadol')
+  })
+
+  it('starts weeks on Monday', () => {
+    // Sunday 30 Aug 2026 belongs to the week that starts Monday 24 Aug
+    const monday = startOfWeek(new Date('2026-08-30T12:00:00'))
+    expect(monday.getDay()).toBe(1)
+    expect(monday.getDate()).toBe(24)
+  })
+
+  it('separates a Sunday and the following Tuesday into different weeks', () => {
+    const weekEpisodes: EpisodeLike[] = [
+      { id: 'sun', started_at: '2026-08-30T12:00:00', ended_at: '2026-08-30T14:00:00', onset_kind: 'gradual', status: 'completed', intensity_segments: [], episode_interventions: [] },
+      { id: 'tue', started_at: '2026-09-01T12:00:00', ended_at: '2026-09-01T14:00:00', onset_kind: 'gradual', status: 'completed', intensity_segments: [], episode_interventions: [] },
+    ]
+    const sundayWeek = buildWeekView(weekEpisodes, startOfWeek(new Date('2026-08-30T12:00:00')))
+    const tuesdayWeek = buildWeekView(weekEpisodes, startOfWeek(new Date('2026-09-01T12:00:00')))
+    expect(sundayWeek.total).toBe(1)
+    expect(sundayWeek.counts[6]).toBe(1) // Sunday = index 6 (Monday-based)
+    expect(tuesdayWeek.total).toBe(1)
+    expect(tuesdayWeek.counts[1]).toBe(1) // Tuesday = index 1
+    expect(earliestWeekStart(weekEpisodes)?.getDate()).toBe(24)
   })
 
   it('builds a compact AI summary', () => {

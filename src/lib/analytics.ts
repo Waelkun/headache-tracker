@@ -8,8 +8,10 @@ export type EpisodeLike = {
   episode_interventions?: Array<{ intervention_type: string; effect: string | null; label: string | null }> | null
 }
 
-const DAY_NAMES_EN = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
-const DAY_NAMES_AR = ['الأحد', 'الاثنين', 'الثلاثاء', 'الأربعاء', 'الخميس', 'الجمعة', 'السبت']
+const DAY_NAMES_EN = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+const DAY_NAMES_AR = ['الاثنين', 'الثلاثاء', 'الأربعاء', 'الخميس', 'الجمعة', 'السبت', 'الأحد']
+
+const mondayIndex = (date: Date) => (date.getDay() + 6) % 7
 
 export function episodeDurationHours(episode: EpisodeLike) {
   if (!episode.ended_at) return 0
@@ -41,9 +43,9 @@ export function buildWeekdayRisk(episodes: EpisodeLike[], locale: 'en' | 'ar') {
     const key = episode.started_at.slice(0, 10)
     if (uniqueDays.has(key)) continue
     uniqueDays.add(key)
-    counts[new Date(episode.started_at).getDay()] += 1
+    counts[mondayIndex(new Date(episode.started_at))] += 1
   }
-  const today = new Date().getDay()
+  const today = mondayIndex(new Date())
   const max = Math.max(1, ...counts)
   const ratio = counts[today] / max
   const level = ratio >= 0.75 && counts[today] >= 2 ? 'high' : ratio >= 0.4 && counts[today] >= 1 ? 'medium' : 'low'
@@ -56,6 +58,42 @@ export function buildWeekdayRisk(episodes: EpisodeLike[], locale: 'en' | 'ar') {
 export function countEpisodesInRange(episodes: EpisodeLike[], days: number) {
   const cutoff = Date.now() - days * 86_400_000
   return episodes.filter((episode) => new Date(episode.started_at).getTime() >= cutoff).length
+}
+
+// Local midnight of the Monday that begins the week containing `date`.
+export function startOfWeek(date: Date): Date {
+  const day = new Date(date.getFullYear(), date.getMonth(), date.getDate())
+  day.setDate(day.getDate() - mondayIndex(day))
+  return day
+}
+
+export function addDays(date: Date, days: number): Date {
+  const next = new Date(date)
+  next.setDate(next.getDate() + days)
+  return next
+}
+
+// Counts episodes per weekday (Mon=0 … Sun=6) within the single week [weekStart, weekStart+7d).
+export function buildWeekView(episodes: EpisodeLike[], weekStart: Date) {
+  const start = weekStart.getTime()
+  const end = start + 7 * 86_400_000
+  const counts = Array.from({ length: 7 }, () => 0)
+  for (const episode of episodes) {
+    const time = new Date(episode.started_at).getTime()
+    if (time < start || time >= end) continue
+    counts[mondayIndex(new Date(episode.started_at))] += 1
+  }
+  return { counts, total: counts.reduce((sum, value) => sum + value, 0) }
+}
+
+// Monday of the earliest episode's week, or null when there are no episodes.
+export function earliestWeekStart(episodes: EpisodeLike[]): Date | null {
+  let earliest = Infinity
+  for (const episode of episodes) {
+    const time = new Date(episode.started_at).getTime()
+    if (time < earliest) earliest = time
+  }
+  return Number.isFinite(earliest) ? startOfWeek(new Date(earliest)) : null
 }
 
 export function buildInterventionStats(episodes: EpisodeLike[]) {

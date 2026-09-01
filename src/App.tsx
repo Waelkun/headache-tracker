@@ -2,16 +2,17 @@ import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 import type { Session } from '@supabase/supabase-js'
 import {
   Activity, ArrowLeft, BarChart3, Brain, CalendarDays, ChevronLeft, ChevronRight, Clock3, FileText,
-  History as HistoryIcon, Languages, Layers3, LayoutGrid, LogOut, MapPin, Moon, NotebookPen, Plus,
-  Save, Sparkles, Square, Sun,
+  History as HistoryIcon, Languages, Layers3, LayoutGrid, MapPin, Moon, NotebookPen, Plus,
+  Save, Sparkles, Square, Sun, Trash2, User,
 } from 'lucide-react'
 import { AuthScreen } from './components/AuthScreen'
 import type { HeadLayer, HeadPoint } from './components/HeadMap3D'
 import { InterventionEditor, type EffectValue, type InterventionDraft, type InterventionTemplate } from './components/InterventionEditor'
 import { answerDataQuestion, buildAskSummary, buildOverview, buildWeekdayRisk, countEpisodesInRange, episodeDurationHours, maxIntensity, parseHeadacheText, reconcileParsedNote, type ParsedNote } from './lib/analytics'
 import { OrganizerReview } from './components/OrganizerReview'
+import { ProfileView } from './components/ProfileView'
 import { copy, type Locale } from './lib/i18n'
-import { supabase } from './lib/supabase'
+import { isAuthError, supabase, tryRecoverSession } from './lib/supabase'
 import type { Database, Json } from './lib/database.types'
 
 import type { CheckInResult } from './components/CheckInSheet'
@@ -33,7 +34,8 @@ type Episode = EpisodeRow & {
   episode_interventions: InterventionRow[]
   pain_locations: PainLocationRow[]
 }
-type View = 'today' | 'history' | 'insights' | 'ask' | 'report'
+type ProfileRow = Database['public']['Tables']['profiles']['Row']
+type View = 'today' | 'history' | 'insights' | 'ask' | 'report' | 'profile'
 type Theme = 'light' | 'dark'
 const DEMO_USER_ID = '00000000-0000-4000-8000-000000000001'
 const LOCATION_COLORS = ['#d94d61', '#d9852f', '#377fbd', '#8a62bd', '#218d77', '#b14f98']
@@ -193,6 +195,7 @@ export default function App() {
   const [authReady, setAuthReady] = useState(false)
   const [episodes, setEpisodes] = useState<Episode[]>([])
   const [interventionTemplates, setInterventionTemplates] = useState<InterventionTemplateRow[]>([])
+  const [profileData, setProfileData] = useState<ProfileRow | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [view, setView] = useState<View>('today')
@@ -241,6 +244,14 @@ export default function App() {
       setAuthReady(true)
     })
     const { data } = supabase.auth.onAuthStateChange(async (event, next) => {
+      if (event === 'SIGNED_OUT') {
+        setSession(null)
+        setEpisodes([])
+        setInterventionTemplates([])
+        setProfileData(null)
+        setAuthReady(true)
+        return
+      }
       if (next) {
         if (event === 'SIGNED_IN' && localStorage.getItem('headache-demo-episodes')) {
           await migrateLocalToAccount(next.user.id)
@@ -253,6 +264,22 @@ export default function App() {
     })
     return () => data.subscription.unsubscribe()
   }, [])
+
+  useEffect(() => {
+    if (!session) return
+    let timer: ReturnType<typeof setTimeout>
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return
+      clearTimeout(timer)
+      timer = setTimeout(async () => {
+        const recovered = await tryRecoverSession()
+        setSession(recovered)
+        if (!recovered) setError(ar ? 'انتهت الجلسة. سجّل دخول من جديد.' : 'Session expired. Please sign in again.')
+      }, 500)
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => { document.removeEventListener('visibilitychange', onVisible); clearTimeout(timer) }
+  }, [session, ar])
 
   useEffect(() => {
     if (demoMode) {
@@ -274,15 +301,41 @@ export default function App() {
     if (demoMode) return
     setLoading(true)
     setError('')
-    const [episodeResult, templateResult] = await Promise.all([
+    const fetchAll = () => Promise.all([
       supabase.from('headache_episodes').select('*, intensity_segments(*), episode_interventions(*), pain_locations(*)').order('started_at', { ascending: false }),
       supabase.from('intervention_templates').select('*').order('created_at', { ascending: true }),
     ])
+    let [episodeResult, templateResult] = await fetchAll()
+    if (isAuthError(episodeResult.error)) {
+      const recovered = await tryRecoverSession()
+      if (!recovered) {
+        setError(ar ? 'انتهت الجلسة. سجّل دخول من جديد.' : 'Session expired. Please sign in again.')
+        setSession(null)
+        setLoading(false)
+        return
+      }
+      setSession(recovered)
+      ;[episodeResult, templateResult] = await fetchAll()
+    }
     if (episodeResult.error) setError(episodeResult.error.message)
     else setEpisodes((episodeResult.data ?? []) as Episode[])
     if (templateResult.error) setError(templateResult.error.message)
     else setInterventionTemplates(templateResult.data ?? [])
+    void loadProfile()
     setLoading(false)
+  }
+
+  async function loadProfile() {
+    if (demoMode || !session) return
+    const { data } = await supabase.from('profiles').select('*').eq('id', session.user.id).maybeSingle()
+    if (data) setProfileData(data)
+  }
+
+  async function updateProfile(displayName: string) {
+    if (!session) return
+    const { error: updateError } = await supabase.from('profiles').upsert({ id: session.user.id, display_name: displayName }).select().single()
+    if (updateError) setError(updateError.message)
+    else await loadProfile()
   }
 
   function updateDemoEpisodes(updater: (current: Episode[]) => Episode[]) {
@@ -417,6 +470,17 @@ export default function App() {
       setParsedNote(null)
       await loadEpisodes()
     }
+  }
+
+  async function deleteEpisode(id: string) {
+    setError('')
+    if (demoMode) {
+      updateDemoEpisodes((current) => current.filter((episode) => episode.id !== id))
+      return
+    }
+    const { error: deleteError } = await supabase.from('headache_episodes').delete().eq('id', id)
+    if (deleteError) setError(deleteError.message)
+    else await loadEpisodes()
   }
 
   async function saveMarks() {
@@ -724,7 +788,8 @@ export default function App() {
   if (!authReady) return <div className="splash"><div className="brand-mark"><Brain /></div><span>{t.loading}</span></div>
   if (!session && !demoMode) return <AuthScreen locale={locale} theme={theme} onLocaleChange={setLocale} onThemeChange={setTheme} onDemo={enterDemo} />
 
-  const displayName = demoMode ? (ar ? 'ضيف' : 'Guest') : session!.user.user_metadata.full_name?.split(' ')[0] || session!.user.email?.split('@')[0] || (ar ? 'أهلاً' : 'there')
+  const avatarUrl = !demoMode && session ? session.user.user_metadata.avatar_url as string | undefined : undefined
+  const displayName = demoMode ? (ar ? 'ضيف' : 'Guest') : profileData?.display_name?.split(' ')[0] || session!.user.user_metadata.full_name?.split(' ')[0] || session!.user.email?.split('@')[0] || (ar ? 'أهلاً' : 'there')
   const dateLabel = new Intl.DateTimeFormat(ar ? 'ar' : 'en', { weekday: 'long', month: 'long', day: 'numeric' }).format(new Date())
 
   return (
@@ -735,7 +800,7 @@ export default function App() {
         <div className="top-actions">
           <button className="icon-button" type="button" onClick={() => setLocale(ar ? 'en' : 'ar')} aria-label={ar ? 'Switch to English' : 'التبديل للعربية'}><Languages size={19} /></button>
           <button className="icon-button" type="button" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} aria-label={theme === 'dark' ? (ar ? 'استخدم الوضع الفاتح' : 'Use light mode') : (ar ? 'استخدم الوضع الداكن' : 'Use dark mode')} aria-pressed={theme === 'dark'}>{theme === 'dark' ? <Sun size={19} /> : <Moon size={19} />}</button>
-          <button className="icon-button" type="button" onClick={() => void leaveAccount()} aria-label={demoMode ? (ar ? 'اخرج من التجربة' : 'Exit demo') : t.signOut}><LogOut size={18} /></button>
+          <button className="icon-button avatar-button" type="button" onClick={() => setView('profile')} aria-label={ar ? 'الملف الشخصي' : 'Profile'} aria-current={view === 'profile' ? 'page' : undefined}>{avatarUrl ? <img className="topbar-avatar" src={avatarUrl} alt="" /> : <User size={18} />}</button>
         </div>
       </header>
 
@@ -763,11 +828,12 @@ export default function App() {
           />
         )}
         {view === 'history' && (selectedEpisodeId
-          ? <EpisodeDetailView episode={episodes.find((episode) => episode.id === selectedEpisodeId)} locale={locale} theme={theme} onBack={() => setSelectedEpisodeId(null)} />
+          ? <EpisodeDetailView episode={episodes.find((episode) => episode.id === selectedEpisodeId)} locale={locale} theme={theme} onBack={() => setSelectedEpisodeId(null)} onDelete={async (id) => { await deleteEpisode(id); setSelectedEpisodeId(null) }} />
           : <HistoryView episodes={episodes} locale={locale} loading={loading} onSelect={setSelectedEpisodeId} />)}
         {view === 'insights' && <Suspense fallback={<ViewLoading locale={locale} />}><InsightsView episodes={episodes} locale={locale} theme={theme} /></Suspense>}
         {view === 'ask' && <AskView locale={locale} episodes={episodes} question={question} answer={answer} source={answerSource} busy={askBusy} onQuestion={setQuestion} onAsk={(text) => void askQuestion(text)} />}
         {view === 'report' && <Suspense fallback={<ViewLoading locale={locale} />}><ReportView episodes={episodes} locale={locale} /></Suspense>}
+        {view === 'profile' && <ProfileView locale={locale} theme={theme} session={session} demoMode={demoMode} storedName={profileData?.display_name ?? null} avatarUrl={avatarUrl} onSaveName={updateProfile} onLocaleChange={setLocale} onThemeChange={setTheme} onLogout={() => void leaveAccount()} onBack={() => setView('today')} />}
       </main>
 
       <nav className="bottom-nav" aria-label={ar ? 'التنقل الرئيسي' : 'Primary navigation'}>
@@ -891,12 +957,14 @@ function HistoryView({ episodes, locale, loading, onSelect }: { episodes: Episod
   return <section className="page-stack"><div className="page-title-row"><div><p className="eyebrow">{ar ? 'كل النوبات' : 'ALL EPISODES'}</p><h2>{ar ? 'سجل وجع الرأس' : 'Headache history'}</h2><p>{ar ? 'اكبس على أي نوبة لتشوف كل تفاصيلها.' : 'Tap any episode to see every recorded detail.'}</p></div><HistoryIcon size={28} /></div>{loading ? <p>{ar ? 'عم نحمّل…' : 'Loading…'}</p> : !episodes.length ? <EmptyState locale={locale} /> : <div className="episode-list">{episodes.map((episode) => <button className="episode-row" type="button" key={episode.id} onClick={() => onSelect(episode.id)}><div className={`episode-severity severity-${Math.ceil(maxIntensity(episode) / 2)}`}>{maxIntensity(episode) || '—'}</div><div><time>{dtf.format(new Date(episode.started_at))}</time><p>{episode.status === 'active' ? (ar ? 'مستمرة الآن' : 'Active now') : `${formatHours(episodeDurationHours(episode), locale)} · ${episode.onset_kind.replace('_', ' ')}`}</p><div className="mini-chips">{episode.pain_character.map((item) => <span key={item}>{item}</span>)}{episode.pain_locations.length > 0 && <span>{ar ? `${episode.pain_locations.length} مواقع محفوظة` : `${episode.pain_locations.length} saved locations`}</span>}{episode.episode_interventions.slice(0, 2).map((item) => <span key={item.id}>{item.label || item.intervention_type}</span>)}</div></div></button>)}</div>}</section>
 }
 
-function EpisodeDetailView({ episode, locale, theme, onBack }: { episode?: Episode; locale: Locale; theme: Theme; onBack: () => void }) {
+function EpisodeDetailView({ episode, locale, theme, onBack, onDelete }: { episode?: Episode; locale: Locale; theme: Theme; onBack: () => void; onDelete: (id: string) => Promise<void> }) {
   const ar = locale === 'ar'
   const locations = useMemo(() => episode ? [...episode.pain_locations].sort((a, b) => a.created_at.localeCompare(b.created_at)) : [], [episode])
   const [selectedLocationId, setSelectedLocationId] = useState<string>('all')
   const [locationView, setLocationView] = useState<'combined' | 'compare'>('combined')
   const [comparePage, setComparePage] = useState(0)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   useEffect(() => { setSelectedLocationId('all'); setLocationView('combined'); setComparePage(0) }, [episode?.id])
   useEffect(() => { setComparePage((page) => Math.min(page, Math.max(0, Math.ceil(locations.length / 2) - 1))) }, [locations.length])
   if (!episode) return <section className="page-stack"><button className="back-link" type="button" onClick={onBack}><ArrowLeft size={18} />{ar ? 'رجوع للسجل' : 'Back to history'}</button><EmptyState locale={locale} /></section>
@@ -919,8 +987,21 @@ function EpisodeDetailView({ episode, locale, theme, onBack }: { episode?: Episo
     <button className="back-link" type="button" onClick={onBack}><ArrowLeft size={18} />{ar ? 'رجوع للسجل' : 'Back to history'}</button>
     <header className="episode-detail-header">
       <div><p className="eyebrow">{episode.status === 'active' ? (ar ? 'نوبة مستمرة' : 'ACTIVE EPISODE') : (ar ? 'تفاصيل النوبة' : 'EPISODE DETAILS')}</p><h2>{started}</h2></div>
-      <span className={`episode-status-pill ${episode.status}`}>{episode.status === 'active' ? (ar ? 'مستمرة' : 'Active') : (ar ? 'منتهية' : 'Completed')}</span>
+      <div className="episode-detail-actions">
+        <span className={`episode-status-pill ${episode.status}`}>{episode.status === 'active' ? (ar ? 'مستمرة' : 'Active') : (ar ? 'منتهية' : 'Completed')}</span>
+        <button type="button" className="delete-icon-button" onClick={() => setConfirmDelete(true)} disabled={episode.status === 'active'} aria-label={ar ? 'احذف النوبة' : 'Delete episode'} title={episode.status === 'active' ? (ar ? 'أنهِ النوبة قبل حذفها' : 'End the episode before deleting') : (ar ? 'احذف النوبة' : 'Delete episode')}><Trash2 size={18} /></button>
+      </div>
     </header>
+    {confirmDelete && <div className="modal-backdrop" role="presentation" onClick={() => !deleting && setConfirmDelete(false)}>
+      <div className="modal-card confirm-card" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+        <h3>{ar ? 'حذف هالنوبة؟' : 'Delete this episode?'}</h3>
+        <p>{ar ? 'رح ينحذف كل شي مرتبط فيها (الشدّات، الأماكن، العلاجات) وما بينرجع.' : 'Everything recorded with it (intensity, locations, treatments) will be permanently removed.'}</p>
+        <div className="confirm-actions">
+          <button type="button" className="ghost-button" onClick={() => setConfirmDelete(false)} disabled={deleting}>{ar ? 'إلغاء' : 'Cancel'}</button>
+          <button type="button" className="danger-button" onClick={async () => { setDeleting(true); await onDelete(episode.id) }} disabled={deleting}><Trash2 size={17} />{deleting ? (ar ? 'عم نحذف…' : 'Deleting…') : (ar ? 'احذف' : 'Delete')}</button>
+        </div>
+      </div>
+    </div>}
     <div className="episode-summary-grid">
       <article><span>{ar ? 'أعلى شدة' : 'Peak intensity'}</span><strong>{maxIntensity(episode) || '—'}<small>/10</small></strong></article>
       <article><span>{ar ? 'المدة' : 'Duration'}</span><strong>{episode.status === 'active' ? formatElapsed(episode.started_at, locale) : formatHours(episodeDurationHours(episode), locale)}</strong></article>
